@@ -1,11 +1,12 @@
 import sys
 import time
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Literal, Optional, List
 
 import lightning as L
 import torch
 from lightning.fabric.strategies import FSDPStrategy
+from torch.nn.utils.rnn import pad_sequence
 
 # support running without installing as a package
 wd = Path(__file__).parent.parent.resolve()
@@ -19,75 +20,55 @@ from lit_gpt.utils import check_valid_checkpoint_dir, get_default_supported_prec
 @torch.inference_mode()
 def generate(
     model: GPT,
-    idx: torch.Tensor,
-    max_returned_tokens: int,
+    x: torch.Tensor,
+    mask: torch.Tensor,
+    max_new_tokens: int,
+    min_T: int,
     *,
     temperature: float = 1.0,
     top_k: Optional[int] = None,
     eos_id: Optional[int] = None,
-) -> torch.Tensor:
-    """Takes a conditioning sequence (prompt) as input and continues to generate as many tokens as requested.
+) -> List[torch.Tensor]:
+    device, dtype = x.device, x.dtype
+    input_pos = torch.arange(min_T, device=device)
+    done = torch.zeros(len(x), dtype=torch.bool, device=device)
 
-    The implementation of this function is modified from A. Karpathy's nanoGPT.
-
-    Args:
-        model: The model to use.
-        idx: Tensor of shape (T) with indices of the prompt sequence.
-        max_returned_tokens: The maximum number of tokens to return (given plus generated).
-        temperature: Scales the predicted logits by 1 / temperature.
-        top_k: If specified, only sample among the tokens with the k highest probabilities.
-        eos_id: If specified, stop generating any more token once the <eos> token is triggered.
-    """
-    T = idx.size(0)
-    assert max_returned_tokens > T
-    if model.max_seq_length < max_returned_tokens - 1:
-        # rolling the kv cache based on the `input_pos` value would be necessary. However, doing so would introduce a
-        # data dependency on the `input_pos` tensor and impact model compilation. Since this setting is uncommon, we do
-        # not support it to avoid negatively impacting the overall speed
-        raise NotImplementedError(f"max_seq_length {model.max_seq_length} needs to be >= {max_returned_tokens - 1}")
-
-    device, dtype = idx.device, idx.dtype
-    # create an empty tensor of the expected final shape and fill in the current tokens
-    empty = torch.empty(max_returned_tokens, dtype=dtype, device=device)
-    empty[:T] = idx
-    idx = empty
-    input_pos = torch.arange(0, T, device=device)
-
-    # generate up to a fixed number of tokens
-    for _ in range(max_returned_tokens - T):
-        x = idx.index_select(0, input_pos).view(1, -1)
-
+    for _ in range(max_new_tokens):
         # forward
-        logits = model(x, input_pos)
-        logits = logits[0, -1] / temperature
+        logits = model(x.index_select(1, input_pos), input_pos)
+        logits = logits[:, -1]
 
         # optionally crop the logits to only the top k options
         if top_k is not None:
             v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
             logits = torch.where(logits < v[[-1]], -float("Inf"), logits)
 
-        probs = torch.nn.functional.softmax(logits, dim=-1)
-        idx_next = torch.multinomial(probs, num_samples=1).to(dtype=dtype)
+        if temperature > 0:
+            probs = torch.nn.functional.softmax(logits / temperature, dim=-1)
+            next = torch.multinomial(probs, num_samples=1).to(dtype=dtype)
+        else:
+            next = torch.argmax(logits, dim=-1)
 
         # advance
         input_pos = input_pos[-1:] + 1
 
         # concatenate the new generation
-        idx = idx.index_copy(0, input_pos, idx_next)
+        x[:, input_pos] = torch.where(mask[:, input_pos], x[:, input_pos], next)
 
         # if <eos> token is triggered, return the output (stop generation)
-        if idx_next == eos_id:
-            return idx[:input_pos]  # include the EOS token
+        done |= next == eos_id
+        if all(done):
+            return x[:, :input_pos].unbind()  # include the EOS token
 
-    return idx
+    return x.unbind()
 
 
 def main(
-    prompt: str = "Hello, my name is",
+    prompts: List[str] = ["Hello, my name is", "Hello, my name is"],
     *,
     num_samples: int = 1,
     max_new_tokens: int = 50,
-    top_k: int = 200,
+    top_k: Optional[int] = 200,
     temperature: float = 0.8,
     checkpoint_dir: Path = Path("checkpoints/stabilityai/stablelm-base-alpha-3b"),
     quantize: Optional[Literal["bnb.nf4", "bnb.nf4-dq", "bnb.fp4", "bnb.fp4-dq", "bnb.int8", "gptq.int4"]] = None,
@@ -156,9 +137,17 @@ def main(
     fabric.print(f"Time to load the model weights: {time.perf_counter() - t0:.02f} seconds.", file=sys.stderr)
 
     tokenizer = Tokenizer(checkpoint_dir)
-    encoded = tokenizer.encode(prompt, device=fabric.device)
-    prompt_length = encoded.size(0)
-    max_returned_tokens = prompt_length + max_new_tokens
+
+    tokens = [tokenizer.encode(p, device=fabric.device) for p in prompts]
+    max_T = max(len(e) for e in tokens)
+    min_T = min(len(e) for e in tokens)
+    assert max_new_tokens > 0
+    max_returned_tokens = max_T + max_new_tokens
+    pad_id = 1234  # FIXME
+    padded_tokens = pad_sequence(tokens, batch_first=True, padding_value=pad_id)
+    x = torch.full((len(tokens), max_new_tokens), pad_id, dtype=padded_tokens.dtype, device=fabric.device)
+    x = torch.cat((padded_tokens, x), dim=1)
+    mask = x != pad_id
 
     with fabric.init_tensor():
         # set the max_seq_length to limit the memory usage to what we need
@@ -168,14 +157,18 @@ def main(
     for i in range(num_samples):
         with fabric.init_tensor():
             # enable the kv cache
-            model.set_kv_cache(batch_size=1)
+            model.set_kv_cache(batch_size=len(prompts))
+        if i != 0:
+            # reset the input tensor
+            x[mask] = pad_id
 
         t0 = time.perf_counter()
-        y = generate(model, encoded, max_returned_tokens, temperature=temperature, top_k=top_k)
+        ys = generate(model, x, mask, max_new_tokens, min_T, temperature=temperature, top_k=top_k)
         t = time.perf_counter() - t0
 
-        fabric.print(tokenizer.decode(y))
-        tokens_generated = y.size(0) - prompt_length
+        for y in ys:
+            fabric.print(tokenizer.decode(y))
+        tokens_generated = max(len(y) - len(t) for y, t in zip(ys, tokens))
         fabric.print(
             f"Time for inference {i + 1}: {t:.02f} sec total, {tokens_generated / t:.02f} tokens/sec", file=sys.stderr
         )
