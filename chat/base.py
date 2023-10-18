@@ -12,7 +12,9 @@ from lightning.fabric.plugins import BitsandbytesPrecision
 wd = Path(__file__).parent.parent.resolve()
 sys.path.append(str(wd))
 
-from lit_gpt import GPT, Config, Tokenizer
+
+# will i have to change the GPT IMport?
+from lit_gpt import GPT, Config, Tokenizer  
 from lit_gpt.utils import (
     check_valid_checkpoint_dir,
     get_default_supported_precision,
@@ -21,6 +23,7 @@ from lit_gpt.utils import (
 )
 
 
+# the GPT model is loaded here
 @torch.inference_mode()
 def generate(
     model: GPT,
